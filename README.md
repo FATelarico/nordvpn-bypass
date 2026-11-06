@@ -1,6 +1,7 @@
 # Per-application split tunnelling with NordVPN on Linux
 
-<img src="https://github.com/FATelarico/nordvpn-bypass/blob/main/logo.png?raw=true" width="224px">
+<img height="700" src="https://github.com/user-attachments/assets/55834de8-584e-4d49-b46d-29d28b09fdf8" />
+
 
 NordVPN's [Linux client](https://github.com/NordSecurity/nordvpn-linux) does not natively provide per-application split tunnelling.
 
