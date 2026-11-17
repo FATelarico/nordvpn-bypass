@@ -1,255 +1,181 @@
-
 #!/usr/bin/env bash
 set -euo pipefail
 
-CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/nordvpn-bypass"
-CONFIG_FILE="$CONFIG_DIR/config"
+readonly CONFIG_FILE="/etc/nordvpn-bypass.conf"
 
-# --------------------------------------------------
-# Configuration initialisation
-# --------------------------------------------------
+die() { printf 'Error: %s\n' "$*" >&2; exit 1; }
 
-mkdir -p "$CONFIG_DIR"
+usage() {
+    cat <<'USAGE'
+Usage:
+  nordvpn-bypass <application> [arguments...]
+  nordvpn-bypass settings
+  nordvpn-bypass set interface <interface>
+  nordvpn-bypass set group <existing-group>
 
-if [[ ! -f "$CONFIG_FILE" ]]; then
-    (
-        umask 077
-        cat > "$CONFIG_FILE" <<'EOF'
-# NordVPN bypass configuration
+All components read the shared configuration from /etc/nordvpn-bypass.conf.
+USAGE
+}
 
-INTERFACE=wlp5s0
-BYPASS_GROUP=nordvpn-bypass
-EOF
-    )
-fi
-
-# --------------------------------------------------
-# Configuration reader
-# --------------------------------------------------
+[[ -r "$CONFIG_FILE" ]] || die "Configuration not found: $CONFIG_FILE. Run the installer first."
 
 load_config() {
+    VPN_USER=""
     INTERFACE=""
     BYPASS_GROUP=""
+    NFT_FAMILY="inet"
+    NFT_TABLE="app_bypass"
+    WRAPPER_PATH=""
+    NORDVPN_SERVICE="nordvpnd.service"
 
     local line key value
-
     while IFS= read -r line || [[ -n "$line" ]]; do
         line="${line%%#*}"
-
         [[ "$line" =~ ^[[:space:]]*$ ]] && continue
-
-        if [[ ! "$line" =~ ^[[:space:]]*([A-Z_]+)[[:space:]]*=[[:space:]]*(.*)$ ]]; then
-            echo "Invalid configuration line: $line" >&2
-            exit 1
-        fi
-
+        [[ "$line" =~ ^[[:space:]]*([A-Z_]+)[[:space:]]*=[[:space:]]*(.*)$ ]] ||
+            die "Invalid line in $CONFIG_FILE: $line"
         key="${BASH_REMATCH[1]}"
         value="${BASH_REMATCH[2]}"
-
         value="${value#"${value%%[![:space:]]*}"}"
         value="${value%"${value##*[![:space:]]}"}"
-
         case "$key" in
-            INTERFACE)
-                INTERFACE="$value"
-                ;;
-            BYPASS_GROUP)
-                BYPASS_GROUP="$value"
-                ;;
-            *)
-                echo "Unknown configuration variable: $key" >&2
-                exit 1
-                ;;
+            VPN_USER) VPN_USER="$value" ;;
+            INTERFACE) INTERFACE="$value" ;;
+            BYPASS_GROUP) BYPASS_GROUP="$value" ;;
+            NFT_FAMILY) NFT_FAMILY="$value" ;;
+            NFT_TABLE) NFT_TABLE="$value" ;;
+            WRAPPER_PATH) WRAPPER_PATH="$value" ;;
+            NORDVPN_SERVICE) NORDVPN_SERVICE="$value" ;;
+            *) die "Unknown setting '$key' in $CONFIG_FILE" ;;
         esac
     done < "$CONFIG_FILE"
 
-    if [[ -z "$INTERFACE" || -z "$BYPASS_GROUP" ]]; then
-        echo "Configuration is incomplete. Check $CONFIG_FILE" >&2
-        exit 1
-    fi
+    [[ -n "$VPN_USER" && -n "$INTERFACE" && -n "$BYPASS_GROUP" ]] ||
+        die "Configuration is incomplete: check $CONFIG_FILE."
 }
 
-# --------------------------------------------------
-# Configuration writer
-# --------------------------------------------------
-
-save_config() {
-    local key="$1"
-    local value="$2"
-    local tmp
-
-    tmp="$(mktemp "$CONFIG_DIR/config.XXXXXX")"
-
+write_config_value() {
+    local key="$1" value="$2" tmp
+    tmp="$(mktemp)"
     awk -v key="$key" -v value="$value" '
         BEGIN { found=0 }
         $0 ~ "^[[:space:]]*" key "[[:space:]]*=" {
-            print key "=" value
-            found=1
+            if (!found++) print key "=" value
             next
         }
         { print }
-        END {
-            if (!found) print key "=" value
-        }
+        END { if (!found) print key "=" value }
     ' "$CONFIG_FILE" > "$tmp"
-
-    chmod 600 "$tmp"
-    mv -- "$tmp" "$CONFIG_FILE"
+    if ! sudo install -o root -g root -m 644 "$tmp" "$CONFIG_FILE"; then
+        rm -f "$tmp"
+        die "Could not update $CONFIG_FILE."
+    fi
+    rm -f "$tmp"
 }
 
-# --------------------------------------------------
-# Settings commands
-# --------------------------------------------------
+get_firewall_mark() {
+    local settings
+    settings="$(nordvpn settings)" || die "Could not read NordVPN settings."
+    grep -qE '^[[:space:]]*Firewall:[[:space:]]+enabled[[:space:]]*$' <<<"$settings" ||
+        die "NordVPN Firewall is not enabled."
+    FIREWALL_MARK="$(awk -F': *' '/^[[:space:]]*Firewall Mark:/ {print $2; exit}' <<<"$settings")"
+    [[ "$FIREWALL_MARK" =~ ^0[xX][[:xdigit:]]+$ ]] || die "Could not determine NordVPN firewall mark."
+}
+
+refresh_nft_rule() {
+    local gid="$1"
+    get_firewall_mark
+    sudo nft delete table "$NFT_FAMILY" "$NFT_TABLE" 2>/dev/null || true
+    sudo nft -f - <<NFT_EOF
+add table $NFT_FAMILY $NFT_TABLE
+add chain $NFT_FAMILY $NFT_TABLE output { type route hook output priority mangle - 1; policy accept; }
+add rule $NFT_FAMILY $NFT_TABLE output meta skgid $gid meta mark set $FIREWALL_MARK counter
+NFT_EOF
+}
 
 show_settings() {
-    local gid
-
+    local gid mark="unavailable" settings
     gid="$(getent group "$BYPASS_GROUP" | cut -d: -f3 || true)"
-
-    echo "NordVPN Bypass Settings"
-    echo "-----------------------"
-    echo "Config file:  $CONFIG_FILE"
-    echo "Interface:    $INTERFACE"
-    echo "Bypass group: $BYPASS_GROUP"
-    echo "Group GID:    ${gid:-NOT FOUND}"
-
-    if [[ -n "$gid" ]]; then
-        echo
-        echo "Required nftables match:"
-        echo "meta skgid $gid"
+    if settings="$(nordvpn settings 2>/dev/null)"; then
+        mark="$(awk -F': *' '/^[[:space:]]*Firewall Mark:/ {print $2; exit}' <<<"$settings")"
+        [[ -n "$mark" ]] || mark="unavailable"
     fi
+    printf '%s\n' \
+        "NordVPN bypass settings" \
+        "-----------------------" \
+        "Configuration:  $CONFIG_FILE" \
+        "NordVPN user:   $VPN_USER" \
+        "Interface:      $INTERFACE" \
+        "Bypass group:   $BYPASS_GROUP" \
+        "Group GID:      ${gid:-NOT FOUND}" \
+        "Firewall mark:  $mark" \
+        "nftables table: $NFT_FAMILY $NFT_TABLE" \
+        "Wrapper path:   ${WRAPPER_PATH:-unknown}"
 }
 
 set_setting() {
-    local setting="${1:-}"
-    local value="${2:-}"
-    local key
-
-    if [[ -z "$setting" || -z "$value" ]]; then
-        echo "Usage: nordvpn-bypass set <interface|group> <value>"
-        exit 2
-    fi
+    local setting="${1:-}" value="${2:-}" gid
+    [[ -n "$setting" && -n "$value" ]] || die "Usage: nordvpn-bypass set <interface|group> <value>"
+    [[ "$(id -un)" == "$VPN_USER" ]] || die "Only the configured NordVPN user '$VPN_USER' can change these settings."
 
     case "$setting" in
         interface)
-            key="INTERFACE"
-
-            if [[ ! "$value" =~ ^[a-zA-Z0-9_.:-]{1,15}$ ]]; then
-                echo "Invalid interface name: $value" >&2
-                exit 1
-            fi
+            [[ "$value" =~ ^[a-zA-Z0-9_.:-]{1,15}$ ]] || die "Invalid interface name: $value"
+            ip link show dev "$value" >/dev/null 2>&1 || die "Interface does not exist: $value"
+            write_config_value INTERFACE "$value"
+            INTERFACE="$value"
+            printf 'Interface updated to %s.\n' "$INTERFACE"
             ;;
         group|bypass-group)
-            key="BYPASS_GROUP"
-
-            if [[ ! "$value" =~ ^[a-zA-Z_][a-zA-Z0-9_.-]*\$?$ ]]; then
-                echo "Invalid group name: $value" >&2
-                exit 1
-            fi
-
-            if ! getent group "$value" >/dev/null; then
-                echo "Group does not exist: $value" >&2
-                exit 1
-            fi
+            [[ "$value" =~ ^[a-zA-Z_][a-zA-Z0-9_-]*$ ]] || die "Invalid group name: $value"
+            getent group "$value" >/dev/null || die "Group does not exist: $value. Create it first or rerun the installer."
+            sudo usermod -aG "$value" "$VPN_USER"
+            gid="$(getent group "$value" | cut -d: -f3)"
+            [[ "$gid" =~ ^[0-9]+$ ]] || die "Could not determine GID for '$value'."
+            write_config_value BYPASS_GROUP "$value"
+            BYPASS_GROUP="$value"
+            refresh_nft_rule "$gid"
+            printf 'Bypass group updated to %s (GID %s).\n' "$value" "$gid"
+            echo "The live nftables rule has been refreshed. Log out and back in to refresh desktop-session group membership."
             ;;
-        *)
-            echo "Unknown setting: $setting" >&2
-            echo "Available settings: interface, group"
-            exit 2
-            ;;
+        *) die "Unknown setting '$setting'. Available settings: interface, group." ;;
     esac
-
-    save_config "$key" "$value"
-
-    echo "$key updated to: $value"
-    echo "Configuration saved to: $CONFIG_FILE"
-
-    if [[ "$key" == "BYPASS_GROUP" ]]; then
-        local gid
-        gid="$(getent group "$value" | cut -d: -f3)"
-
-        echo
-        echo "IMPORTANT: Your nftables rule must also match GID $gid."
-        echo "The existing firewall rule has not been modified."
-    fi
 }
-
-# --------------------------------------------------
-# Command dispatcher
-# --------------------------------------------------
 
 load_config
 
 case "${1:-}" in
     settings)
+        (($# == 1)) || die "Usage: nordvpn-bypass settings"
         show_settings
         exit 0
         ;;
     set)
         shift
-        set_setting "${1:-}" "${2:-}"
+        (($# == 2)) || die "Usage: nordvpn-bypass set <interface|group> <value>"
+        set_setting "$1" "$2"
         exit 0
         ;;
-    --help|-h|help)
-        cat <<EOF
-Usage:
-  nordvpn-bypass <application> [arguments...]
-
-Commands:
-  settings                  Display current configuration
-  set interface <name>     Change network interface
-  set group <name>         Change bypass group
-  help                     Display this help
-
-Configuration:
-  $CONFIG_FILE
-EOF
+    help|-h|--help)
+        usage
         exit 0
         ;;
 esac
 
-
-
-# --------------------------------------------------
-# Application launcher
-# --------------------------------------------------
-
-if (($# == 0)); then
-    echo "Usage: nordvpn-bypass <application> [arguments...]"
-    echo "Run 'nordvpn-bypass help' for more information."
-    exit 2
-fi
-
-if (( EUID == 0 )); then
-    echo "Run nordvpn-bypass as your normal user, without sudo."
-    exit 1
-fi
+(($# > 0)) || { usage >&2; exit 2; }
+(( EUID != 0 )) || die "Run nordvpn-bypass as your normal desktop user, without sudo."
 
 U="$(id -un)"
+[[ "$U" == "$VPN_USER" ]] || die "This installation is configured for '$VPN_USER', not '$U'."
 H="$(getent passwd "$U" | cut -d: -f6)"
 RUNTIME="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+getent group "$BYPASS_GROUP" >/dev/null || die "Bypass group does not exist: $BYPASS_GROUP"
+ip link show dev "$INTERFACE" >/dev/null 2>&1 || die "Network interface not found: $INTERFACE"
+[[ -d "$RUNTIME" ]] || die "Runtime directory not found: $RUNTIME"
 
-if ! getent group "$BYPASS_GROUP" >/dev/null; then
-    echo "Bypass group does not exist: $BYPASS_GROUP"
-    exit 1
-fi
-
-if ! ip link show dev "$INTERFACE" >/dev/null 2>&1; then
-    echo "Network interface not found: $INTERFACE"
-    exit 1
-fi
-
-if [[ ! -d "$RUNTIME" ]]; then
-    echo "Runtime directory not found: $RUNTIME"
-    exit 1
-fi
-
-# Safely quote all application arguments.
+# Preserve the exact, tested launch sequence: system manager -> runuser -> env -> sg.
 printf -v COMMAND '%q ' "$@"
 COMMAND="exec $COMMAND"
-
-# Use the exact environment and launch sequence
-# confirmed to work with FreeTube.
 exec sudo systemd-run --system --scope \
     -p "BindNetworkInterface=$INTERFACE" \
     -- runuser -u "$U" -- \
