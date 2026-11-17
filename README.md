@@ -1,5 +1,7 @@
 # Per-application split tunnelling with NordVPN on Linux
 
+<img height="700" src="https://github.com/user-attachments/assets/55834de8-584e-4d49-b46d-29d28b09fdf8" />
+
 This project provides an unofficial Linux workaround for launching selected applications outside the NordVPN tunnel while other applications continue to use NordVPN. It combines Linux groups, `nftables` packet marks, policy routing, and systemd's `BindNetworkInterface` property.
 
 **Tested configuration:** Debian 14, systemd 262, NordVPN 6.0.1, NordLynx. Other combinations may work but have not been verified by this project.
